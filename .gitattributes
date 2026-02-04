@@ -1,0 +1,8 @@
+*.bat   eol=crlf
+*.js    eol=lf
+*.json  eol=lf
+*.xml   eol=lf
+*.html  eol=lf
+*.sh    eol=lf
+*.txt   eol=lf
+*.md    eol=lf

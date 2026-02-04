@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""Parser for format files and senders."""
+
+import re
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+MARKER_COLUMNS = "-----COLUMNS-----"
+MARKER_EXAMPLE = "-----EXAMPLE-----"
+
+ALLOWED_COLUMNS = {
+    "payee",
+    "income",
+    "outcome",
+    "fee",
+    "cashback",
+    "op_income",
+    "op_outcome",
+    "balance",
+    "comment",
+    "av_balance",
+    "instrument",
+    "op_instrument",
+    "acc_instrument",
+    "date",
+    "syncid",
+    "mcc",
+}
+
+
+def normalize_column_name(column):
+    """Return base column name (before #) for validation."""
+    return column.split("#")[0].strip()
+
+
+@dataclass
+class SmsFormat:
+    regex: str
+    regex_group_names: list
+    examples: list
+    name: Optional[str] = None
+    id: Optional[Union[int, str]] = None
+    company_id: Optional[str] = None
+    changed: Optional[str] = None
+
+    def to_diff_dict(self):
+        return {
+            "id": self.id,
+            "companyId": self.company_id,
+            "changed": self.changed,
+            "name": self.name,
+            "regexp": self.regex.strip(),
+            "regexpGroupNames": [c.strip() for c in self.regex_group_names],
+            "examples": [ex.strip() for ex in self.examples],
+        }
+
+    @classmethod
+    def from_diff_dict(cls, d):
+        regex = d.get("regexp")
+        if isinstance(regex, str):
+            regex = _clean_text(regex)
+        else:
+            regex = ""
+        names = d.get("regexpGroupNames")
+        if names is None:
+            names = []
+        elif isinstance(names, str):
+            names = [n.strip() for n in names.strip().split(";")] if names else []
+        else:
+            names = [str(n).strip() for n in names]
+        examples = d.get("examples")
+        if not isinstance(examples, list):
+            examples = []
+        return cls(
+            regex=regex,
+            regex_group_names=names,
+            examples=examples,
+            name=d.get("name"),
+            id=d.get("id"),
+            company_id=d.get("companyId"),
+            changed=d.get("changed"),
+        )
+
+
+@dataclass
+class DeletedSmsFormat:
+    id: str
+    changed: str
+
+    def to_diff_dict(self):
+        return {"id": self.id, "changed": self.changed}
+
+    @classmethod
+    def from_diff_dict(cls, d):
+        return cls(
+            id=str(d.get("id", "")),
+            changed=str(d.get("changed", "")),
+        )
+
+
+def clean_name(name):
+    if not isinstance(name, str):
+        return ""
+    s = re.sub(r"['\"$]", "", name)
+    s = re.sub(r"[/\\.{}_()]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _clean_text(text):
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r"[\n\r]+", " ", text).strip()
+
+
+def _letters_only(text):
+    """Keep word chars, strip digits, then take first 30 chars (for get_format_name)."""
+    s = re.sub(r"[^\w]+", " ", text)
+    s = re.sub(r"\d", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def get_format_name(format_obj):
+    if not format_obj:
+        return ""
+    examples = (
+        format_obj.get("examples")
+        if isinstance(format_obj, dict)
+        else getattr(format_obj, "examples", None)
+    )
+    if isinstance(examples, list):
+        for example in examples:
+            text = example if isinstance(example, str) else ""
+            name = _letters_only(text)[:50].strip()
+            if name:
+                return clean_name(name)
+    name_attr = (
+        format_obj.get("name")
+        if isinstance(format_obj, dict)
+        else getattr(format_obj, "name", None)
+    )
+    return clean_name(name_attr or "")
+
+
+@dataclass
+class ValidationError(Exception):
+    """Structured validation error with location (file, example) and fix hints.
+    Used both as raised exception (parse_format_file, compile_regex) and as value in lists.
+    """
+
+    kind: str  # one of: invalid_format, unknown_column, invalid_name,
+    # example_no_match, group_count_mismatch, cross_match, regex_error
+    file_path: str
+    message: str
+    example_index: Optional[int] = None
+    example_text: Optional[str] = None
+    other_file_path: Optional[str] = None
+    expected_name: Optional[str] = None
+
+    def __str__(self):
+        if self.file_path and not self.message.startswith(self.file_path):
+            return f"{self.file_path}: {self.message}"
+        return self.message
+
+
+def parse_senders(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    lines = re.split(r"\r?\n", content)
+    return [line.strip() for line in lines if line.strip()]
+
+
+def parse_format_file(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    lines = content.splitlines()
+    if not lines:
+        raise ValidationError(
+            kind="invalid_format", file_path=file_path, message="Invalid format file: missing regex"
+        )
+    regex_line = lines[0].strip() if lines[0] else ""
+    if not regex_line:
+        raise ValidationError(
+            kind="invalid_format", file_path=file_path, message="Invalid format file: missing regex"
+        )
+
+    i = 1
+    if i >= len(lines) or lines[i].strip() != "":
+        raise ValidationError(
+            kind="invalid_format",
+            file_path=file_path,
+            message=f"Invalid format file: expected empty line before {MARKER_COLUMNS}",
+        )
+    while i < len(lines) and lines[i].strip() == "":
+        i += 1
+    if i >= len(lines) or lines[i].strip() != MARKER_COLUMNS:
+        raise ValidationError(
+            kind="invalid_format",
+            file_path=file_path,
+            message=f"Invalid format file: missing {MARKER_COLUMNS} section",
+        )
+    i += 1
+    if i >= len(lines):
+        raise ValidationError(
+            kind="invalid_format",
+            file_path=file_path,
+            message="Invalid format file: missing columns line",
+        )
+    columns_line = lines[i].strip()
+    columns = [c.strip() for c in columns_line.split(";")] if columns_line else []
+    i += 1
+
+    examples = []
+    if i >= len(lines) or lines[i].strip() != "":
+        raise ValidationError(
+            kind="invalid_format",
+            file_path=file_path,
+            message=f"Invalid format file: expected empty line before {MARKER_EXAMPLE}",
+        )
+    while i < len(lines) and lines[i].strip() == "":
+        i += 1
+    while i < len(lines):
+        if lines[i].strip() != MARKER_EXAMPLE:
+            raise ValidationError(
+                kind="invalid_format",
+                file_path=file_path,
+                message=f"Invalid format file: expected {MARKER_EXAMPLE}",
+            )
+        i += 1
+        example_lines = []
+        while i < len(lines) and lines[i].strip() != MARKER_EXAMPLE:
+            example_lines.append(lines[i])
+            i += 1
+        if i < len(lines) and example_lines and example_lines[-1].strip() != "":
+            raise ValidationError(
+                kind="invalid_format",
+                file_path=file_path,
+                message=f"Invalid format file: expected empty line before {MARKER_EXAMPLE}",
+            )
+        example_text = "\n".join(example_lines)
+        if not example_text.strip():
+            raise ValidationError(
+                kind="invalid_format",
+                file_path=file_path,
+                message="Invalid format file: empty example",
+            )
+        examples.append(example_text)
+
+    if not examples:
+        raise ValidationError(
+            kind="invalid_format",
+            file_path=file_path,
+            message="Invalid format file: no examples",
+        )
+
+    return SmsFormat(
+        regex=regex_line,
+        regex_group_names=columns,
+        examples=examples,
+    )
+
+
+def write_format_file(file_path, format, examples=None):
+    """Write format file from format entity (regex, regex_group_names, examples)."""
+    examples = examples if examples is not None else format.examples
+    if not examples:
+        raise ValueError("Cannot write format file with no examples")
+    regex_line = format.regex
+    columns_line = ";".join(format.regex_group_names)
+    blocks = [
+        regex_line.strip(),
+        MARKER_COLUMNS + "\n" + (columns_line.strip() if columns_line else ""),
+    ]
+    for ex in examples:
+        blocks.append(MARKER_EXAMPLE + "\n" + (ex.strip() if ex else ""))
+    content = "\n\n".join(blocks) + "\n"
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def compile_regex(regex_line, file_path):
+    """Parse /pattern/flags or plain pattern; return compiled regex. Raises ValidationError."""
+    pattern = _clean_text(regex_line)
+    flags = 0
+    if regex_line.startswith("/") and regex_line.rfind("/") > 0:
+        last_slash = regex_line.rfind("/")
+        pattern = regex_line[1:last_slash]
+        flags_str = regex_line[last_slash + 1 :]
+        if "i" in flags_str:
+            flags |= re.IGNORECASE
+        if "u" in flags_str:
+            flags |= re.UNICODE
+        if "m" in flags_str:
+            flags |= re.MULTILINE
+        if "s" in flags_str:
+            flags |= re.DOTALL
+    try:
+        return re.compile(pattern, flags)
+    except re.error as e:
+        raise ValidationError(
+            kind="regex_error", file_path=file_path, message=f"Invalid regex: {e}"
+        )
+
+
+def _example_preview(text, max_len=60):
+    """First max_len chars of cleaned text, with … if longer."""
+    t = _clean_text(text)
+    return (t[:max_len] + "…") if len(t) > max_len else t
+
+
+def validate_format_columns(fmt, file_path=""):
+    """Return list of ValidationErrors for disallowed column names."""
+    errors: List[ValidationError] = []
+    for col in fmt.regex_group_names:
+        name = normalize_column_name(col)
+        if name not in ALLOWED_COLUMNS:
+            errors.append(
+                ValidationError(
+                    kind="unknown_column",
+                    file_path=file_path,
+                    message=f"Unknown column: {col}",
+                )
+            )
+    return errors
+
+
+def validate_format_examples(fmt, file_path="", compiled_regex=None):
+    """Return list of ValidationErrors for regex match and group count."""
+    errors: List[ValidationError] = []
+    if compiled_regex is None:
+        try:
+            compiled_regex = compile_regex(fmt.regex, file_path)
+        except ValidationError as e:
+            return [e]
+    expected_groups = len(fmt.regex_group_names)
+    total = len(fmt.examples)
+    for idx, example in enumerate(fmt.examples):
+        trimmed = _clean_text(example)
+        preview = _example_preview(example)
+        ctx = f"example {idx + 1}/{total}: {preview}"
+        try:
+            match = compiled_regex.search(trimmed)
+            if not match:
+                errors.append(
+                    ValidationError(
+                        kind="example_no_match",
+                        file_path=file_path,
+                        message=f"{ctx}: example does not match its regex",
+                        example_index=idx,
+                        example_text=example,
+                    )
+                )
+                continue
+            group_count = len(match.groups())
+            if group_count != expected_groups and expected_groups > 0:
+                errors.append(
+                    ValidationError(
+                        kind="group_count_mismatch",
+                        file_path=file_path,
+                        message=f"{ctx}: expected {expected_groups} groups, got {group_count}",
+                        example_index=idx,
+                        example_text=example,
+                    )
+                )
+        except Exception as e:
+            errors.append(
+                ValidationError(
+                    kind="regex_error",
+                    file_path=file_path,
+                    message=f"{ctx}: {e}",
+                    example_index=idx,
+                    example_text=example,
+                )
+            )
+    return errors
+
+
+def validate_format_name(format_name, fmt, file_path=""):
+    """Return list of ValidationErrors for format file/dir name."""
+    errors: List[ValidationError] = []
+    cleaned = clean_name(format_name)
+    if format_name != cleaned:
+        errors.append(
+            ValidationError(
+                kind="invalid_name",
+                file_path=file_path,
+                message="Invalid format file name (expected clean name)",
+                expected_name=cleaned,
+            )
+        )
+    expected = get_format_name(fmt)
+    if expected and format_name != expected:
+        errors.append(
+            ValidationError(
+                kind="invalid_name",
+                file_path=file_path,
+                message=f"Invalid format file name, must be {expected}",
+                expected_name=expected,
+            )
+        )
+    return errors
+
+
+def validate_cross_match(formats_with_regex, bank_label):
+    """formats_with_regex: list of (SmsFormat, compiled_regex, file_path).
+    Returns list of ValidationErrors for cross-match.
+    """
+    errors: List[ValidationError] = []
+    for idx, (fmt, compiled, file_path) in enumerate(formats_with_regex):
+        for ex_idx, example in enumerate(fmt.examples):
+            trimmed = _clean_text(example)
+            for other_idx, (_, other_compiled, other_path) in enumerate(formats_with_regex):
+                if idx == other_idx:
+                    continue
+                try:
+                    if other_compiled.search(trimmed):
+                        preview = _example_preview(example)
+                        errors.append(
+                            ValidationError(
+                                kind="cross_match",
+                                file_path=file_path,
+                                message=(
+                                    f"example {ex_idx + 1}/{len(fmt.examples)}: "
+                                    f"{preview} — matches {other_path}",
+                                ),
+                                example_index=ex_idx,
+                                example_text=example,
+                                other_file_path=other_path,
+                            )
+                        )
+                        break
+                except Exception as e:
+                    errors.append(
+                        ValidationError(
+                            kind="regex_error",
+                            file_path=other_path,
+                            message=f"Regex error for example: {e}",
+                            example_index=ex_idx,
+                            example_text=example,
+                        )
+                    )
+    return errors
+
+
+def validate_sms_format_for_import(fmt):
+    """Return list of errors for format entry from diff (company_id, id, derivable name)."""
+    errors = []
+    if fmt.company_id is None or not fmt.id:
+        errors.append("Format entry missing companyId or id")
+    name = get_format_name(fmt)
+    if not name:
+        errors.append(f"Format entry missing example {fmt.id}")
+    return errors
+
+
+def validate_sms_format(fmt, file_path="", format_name=None, compiled_regex=None):
+    """Run column, example, and optional name validation; return list of ValidationErrors."""
+    errors: List[ValidationError] = []
+    errors.extend(validate_format_columns(fmt, file_path))
+    errors.extend(validate_format_examples(fmt, file_path, compiled_regex=compiled_regex))
+    if format_name is not None:
+        errors.extend(validate_format_name(format_name, fmt, file_path))
+    return errors

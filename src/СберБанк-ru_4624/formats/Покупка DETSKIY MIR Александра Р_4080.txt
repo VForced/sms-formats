@@ -1,0 +1,7 @@
+^Покупка\s+(\d{4})\s+(.*?)\s+([\d\s.,]*\d)\s*([а-яa-zA-Z]{1,3}|\W)(?:\s+║\s+.*)$
+
+-----COLUMNS-----
+syncid;payee;outcome;instrument
+
+-----EXAMPLE-----
+Покупка 3152 DETSKIY MIR 697 ₽ ║ Александра Р.
