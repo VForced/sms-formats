@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from import_changes import commit_file_or_raise
 from sms_format import (
     ALLOWED_COLUMNS,
+    AMOUNT_COLUMNS,
     SmsFormat,
     ValidationError,
     _clean_text,
@@ -399,10 +401,15 @@ def _validate_regex_runtime(
         ]
 
     for idx, item in enumerate(entity_items):
-        name = item["name"]
+        name = item["name"].strip()
         expected = item["value"].strip()
         actual_raw = groups[idx]
         actual = str(actual_raw).strip() if actual_raw is not None else ""
+
+        if name in AMOUNT_COLUMNS:
+            expected = re.sub(r"\s+", "", expected)
+            actual = re.sub(r"\s+", "", actual)
+
         if actual != expected:
             try:
                 span = match.span(idx + 1)
@@ -450,6 +457,10 @@ async def _generate_regex_with_retry(
             if previous_errors
             else None
         )
+
+        if DEBUG_LLM_OUTPUT:
+            print(f"Generation attempt: {attempt}, previous errors: {serialized_errors}")
+
         try:
             regex = await generate_fn(previous_regex, serialized_errors)
             if not isinstance(regex, str) or not regex.strip():
