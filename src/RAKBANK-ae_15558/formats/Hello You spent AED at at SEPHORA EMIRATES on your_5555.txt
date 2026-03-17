@@ -1,0 +1,7 @@
+^Hello\. You spent ([A-Z]{3}) ([\d,.]+) at (.*?) on your (.*?) ([\d\*]+) on ([\d/]+)\. Combined Available Balance: ([A-Z]{3}) ([\d,.]+)\.$
+
+-----COLUMNS-----
+instrument;outcome;payee;comment;syncid;date#dd/MM;acc_instrument;av_balance
+
+-----EXAMPLE-----
+Hello. You spent AED 178.00 at SEPHORA EMIRATES on your Credit Card 559580******6283 on 16/03. Combined Available Balance: AED 43717.68.
